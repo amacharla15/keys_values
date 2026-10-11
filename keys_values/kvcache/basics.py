@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Callable, List, Any
 
 import torch
@@ -153,12 +154,27 @@ class KVCacheWithBuffers(DefaultKVCache):
         its KV caches. This works only if KV cache buffers are deallocated.
 
         """
+        self.clear_rollback_point()
         self.kv_buffers.deallocate()
         self._device = None
 
     @property
     def buffers_are_allocated(self) -> bool:
         return self.kv_buffers.buffers_are_allocated
+
+    def _check_rollback_supported_now(self):
+        if not self.buffers_are_allocated:
+            raise IndexError("Buffers are not allocated. Call 'prefill' first.")
+        if self.do_replay_logging:
+            raise ValueError(
+                "Rollback is not supported while replay logging is switched "
+                "on. Call 'switch_replay_logging(False)' first"
+            )
+        if self._checkpoint_hook is not None:
+            raise ValueError(
+                "Rollback is not supported while a checkpoint hook is set. "
+                "Call 'set_checkpoint_hook(None)' first"
+            )
 
     def set_checkpoint_hook(
         self,
@@ -354,6 +370,17 @@ class DenseKVCache(KVCacheWithBuffers):
     def max_forward_length(self) -> int:
         return self.cache_length - self.input_pos
 
+    @property
+    def supports_rollback(self) -> bool:
+        return True
+
+    def _rollback(self, num: int):
+        # Slots are filled in order, so that `current_length == input_pos`.
+        # Removing the most recent tokens only requires to shorten the
+        # buffers. Their content beyond `current_length` is never read and
+        # will be overwritten.
+        self.kv_buffers.current_length -= num
+
     def _forward_internal(
         self,
         key: torch.Tensor,
@@ -495,6 +522,43 @@ class LastRecentlyInsertedKVCacheReplayLog(DefaultKVCacheReplayLog):
 DEFAULT_INIT_GRACE_TOKENS = 16
 
 
+@dataclass
+class SlotsRollbackEntry:
+    """
+    Undo information for a single :meth:`forward` call of a cache which
+    writes tokens to slots in ring buffer order.
+
+    Only slots which were occupied before the call need their content
+    restored. Slots which were free (the cache was still filling up) just
+    become free again.
+
+    Args:
+        slots: Slot positions written to, in the order of the tokens
+        occupied: Indexes into `slots` of slots which were occupied before
+            the call, in increasing order
+        key: Content of occupied slots before the call,
+            `(batch_size, n_query_groups, len(occupied), head_size)`
+        value: Same for values
+        token_pos: Token positions of occupied slots before the call,
+            shape `(len(occupied),)`
+        next_position: Position of first slot to write to, before the call
+        current_length: Current cache length before the call
+
+    """
+
+    slots: List[int]
+    occupied: List[int]
+    key: Optional[torch.Tensor]
+    value: Optional[torch.Tensor]
+    token_pos: Optional[torch.Tensor]
+    next_position: int
+    current_length: int
+
+    @property
+    def num(self) -> int:
+        return len(self.slots)
+
+
 class LastRecentlyInsertedKVCache(KVCacheWithBuffers):
     """
     Baseline key-value cache which stores the last recently inserted
@@ -538,6 +602,9 @@ class LastRecentlyInsertedKVCache(KVCacheWithBuffers):
         # Position of first slot to overwrite with next :meth:`forward`
         self.next_position = None
         self._replay_log = None
+        # Undo information for :meth:`rollback`, one entry per :meth:`forward`
+        # call since the rollback point
+        self._rollback_entries: List[SlotsRollbackEntry] = []
 
     @staticmethod
     def from_config(
@@ -591,6 +658,118 @@ class LastRecentlyInsertedKVCache(KVCacheWithBuffers):
     def max_forward_length(self) -> int:
         return self.cache_length - self.init_grace_tokens
 
+    @property
+    def supports_rollback(self) -> bool:
+        return True
+
+    def _ring_slots(self, num: int) -> List[int]:
+        """
+        Returns:
+            Slots written to by the next :meth:`forward` call with `num`
+            tokens, same as `positions` in :meth:`_forward_internal`
+
+        """
+        np = self.next_position
+        num1 = min(num, self.cache_length - np)
+        start = self.init_grace_tokens
+        return list(range(np, np + num1)) + list(range(start, start + num - num1))
+
+    def _slots_index(self, slots: List[int]) -> torch.Tensor:
+        """
+        Creates an index tensor for `slots` on the device. Slots written in
+        ring buffer order form at most a few runs of consecutive positions,
+        which are created with `torch.arange`. This avoids a host-to-device
+        copy, which would synchronize the device with the host.
+
+        """
+        kwargs = dict(dtype=torch.int64, device=self.device)
+        parts = []
+        run_start = prev = slots[0]
+        for slot in slots[1:]:
+            if slot != prev + 1:
+                parts.append(torch.arange(run_start, prev + 1, **kwargs))
+                run_start = slot
+            prev = slot
+        parts.append(torch.arange(run_start, prev + 1, **kwargs))
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+    def _record_rollback_entry(self, num: int):
+        """
+        Records undo information before `num` tokens are written.
+
+        """
+        slots = self._ring_slots(num)
+        current_length = self.current_length
+        occupied = [i for i, slot in enumerate(slots) if slot < current_length]
+        key = value = token_pos = None
+        if occupied:
+            index = self._slots_index([slots[i] for i in occupied])
+            key, value = self.kv_buffers.get_slots(
+                index_to_3d(index, self.batch_size, self.n_query_groups)
+            )
+            # `get_slots` may return views of the buffers
+            key = key.clone()
+            value = value.clone()
+            token_pos = self.token_pos[index].clone()
+        self._rollback_entries.append(
+            SlotsRollbackEntry(
+                slots=slots,
+                occupied=occupied,
+                key=key,
+                value=value,
+                token_pos=token_pos,
+                next_position=self.next_position,
+                current_length=current_length,
+            )
+        )
+
+    def _rollback(self, num: int):
+        # Undo the most recent :meth:`forward` calls in reverse order. The
+        # last one may be undone partially. Since slots are written to in
+        # ring buffer order, a :meth:`forward` call with fewer tokens would
+        # have written to a prefix of the same slots.
+        while num > 0:
+            entry = self._rollback_entries[-1]
+            num_undo = min(num, entry.num)
+            num_keep = entry.num - num_undo
+            # Occupied slots among the undone ones form a suffix of
+            # `entry.occupied`
+            first = sum(1 for i in entry.occupied if i < num_keep)
+            if first < len(entry.occupied):
+                index = self._slots_index(
+                    [entry.slots[i] for i in entry.occupied[first:]]
+                )
+                self.kv_buffers.set_slots(
+                    positions=index_to_3d(index, self.batch_size, self.n_query_groups),
+                    key=entry.key[:, :, first:, :],
+                    value=entry.value[:, :, first:, :],
+                )
+                self.token_pos[index] = entry.token_pos[first:]
+            if num_keep == 0:
+                self.next_position = entry.next_position
+                self.kv_buffers.current_length = entry.current_length
+                self._rollback_entries.pop()
+            else:
+                self.next_position = entry.slots[num_keep]
+                self.kv_buffers.current_length = min(
+                    entry.current_length + num_keep,
+                    self.cache_length,
+                )
+                keep_occ = first > 0
+                self._rollback_entries[-1] = SlotsRollbackEntry(
+                    slots=entry.slots[:num_keep],
+                    occupied=entry.occupied[:first],
+                    key=entry.key[:, :, :first, :] if keep_occ else None,
+                    value=entry.value[:, :, :first, :] if keep_occ else None,
+                    token_pos=entry.token_pos[:first] if keep_occ else None,
+                    next_position=entry.next_position,
+                    current_length=entry.current_length,
+                )
+            num -= num_undo
+
+    def _clear_rollback_info(self):
+        self._rollback_entries = []
+
     def _forward_internal(
         self,
         key: torch.Tensor,
@@ -608,6 +787,8 @@ class LastRecentlyInsertedKVCache(KVCacheWithBuffers):
             n_query_groups=self.n_query_groups,
             device=self.device,
         )
+        if self.rollback_point_is_marked:
+            self._record_rollback_entry(num)
         k_and_v = self.kv_buffers.forward(
             positions=positions,
             key=key,

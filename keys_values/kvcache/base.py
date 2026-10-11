@@ -349,6 +349,77 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    @property
+    def supports_rollback(self) -> bool:
+        """
+        Rollback allows tokens inserted by :meth:`forward` to be removed
+        again, see :meth:`mark_rollback_point` and :meth:`rollback`. This is
+        needed for speculative decoding, where a verification step inserts
+        draft tokens, some of which may be rejected.
+
+        Returns:
+            Does this cache support :meth:`mark_rollback_point` and
+            :meth:`rollback`?
+
+        """
+        return False
+
+    def mark_rollback_point(self) -> None:
+        """
+        Marks the current cache state as rollback point. Information for
+        tokens inserted by subsequent :meth:`forward` calls (with
+        `input_pos > 0`) is recorded, so that any number of them can be
+        removed again by :meth:`rollback`. Calling this method again replaces
+        the previous rollback point. The rollback point is cleared by
+        :meth:`rollback`, :meth:`clear_rollback_point`, :meth:`reset`, or by
+        a prefill call of :meth:`forward`.
+
+        The cache must have been prefilled (`input_pos > 0`). Recording
+        undo information has a cost, which depends on the cache. Clear the
+        rollback point when it is not needed anymore.
+
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support rollback, which is "
+            "required for speculative decoding"
+        )
+
+    def rollback(self, num: int) -> None:
+        """
+        Removes the `num` most recently inserted tokens from the cache. These
+        must all have been inserted after the last recent call of
+        :meth:`mark_rollback_point`. Afterwards, the cache is in the state it
+        would be in if these tokens had not been passed to :meth:`forward`:
+        `input_pos` decreases by `num`, and slots overwritten by these tokens
+        are restored. The rollback point is cleared afterwards.
+
+        Note that KV content for the remaining tokens is not recomputed. If a
+        :meth:`forward` call inserted `n` tokens and the last `num < n` of
+        them are removed, KV content for the first `n - num` tokens is the one
+        computed in this call. Also, if buffers are quantized, restored slots
+        are re-quantized from their de-quantized content, which need not be
+        bit-identical to the original quantized content.
+
+        Args:
+            num: Number of tokens to remove. Must be between 0 and the number
+                of tokens inserted since the rollback point. If `num == 0`,
+                the rollback point is just cleared.
+
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support rollback, which is "
+            "required for speculative decoding"
+        )
+
+    def clear_rollback_point(self) -> None:
+        """
+        Clears the rollback point set by :meth:`mark_rollback_point`, so that
+        undo information is not recorded anymore. Does nothing if there is no
+        rollback point.
+
+        """
+        pass
+
     def set_seq_length(self, seq_length: int) -> None:
         """
         Elements of a KV cache may depend on the current sequence length, or
@@ -445,6 +516,9 @@ class DefaultKVCache(KVCache):
             self.mha = mha
         self._device = None  # Unassigned so far
         self._input_pos = 0
+        # Number of tokens inserted since :meth:`mark_rollback_point`, or
+        # `None` if there is no rollback point
+        self._num_since_rollback_point = None
 
     @property
     def input_pos(self) -> int:
@@ -565,6 +639,9 @@ class DefaultKVCache(KVCache):
 
         # Call :meth:`_forward` or :meth:`_prefill`, depending on `for_prefill`
         if for_prefill:
+            # A prefill starts a new sequence, so a rollback point cannot be
+            # kept
+            self.clear_rollback_point()
             self._prefill(key, value, token_idx)
             # In this case, `k_and_v` can vend both keys and values at the same
             # time.
@@ -574,6 +651,8 @@ class DefaultKVCache(KVCache):
             # Instead of asking for the key and value tensors as such,
             # `k_and_v` allows access to them.
             k_and_v = self._forward(key, value, token_idx)
+            if self._num_since_rollback_point is not None:
+                self._num_since_rollback_point += num
         # Important to increase this here, since cache has been extended
         self._input_pos += num
 
@@ -698,11 +777,82 @@ class DefaultKVCache(KVCache):
         return result
 
     def reset(self) -> None:
+        self.clear_rollback_point()
         self._reset()
         self._input_pos = 0
 
     def _reset(self):
         raise NotImplementedError()
+
+    @property
+    def rollback_point_is_marked(self) -> bool:
+        """
+        Returns:
+            Is there a rollback point? If so, subclasses need to record undo
+            information in :meth:`_forward`.
+
+        """
+        return self._num_since_rollback_point is not None
+
+    def mark_rollback_point(self) -> None:
+        if not self.supports_rollback:
+            super().mark_rollback_point()  # Raises exception
+        if self.input_pos == 0:
+            raise IndexError(
+                "Cache needs to be initialized with 'prefill' before a "
+                "rollback point can be marked"
+            )
+        self._check_rollback_supported_now()
+        self.clear_rollback_point()
+        self._num_since_rollback_point = 0
+
+    def rollback(self, num: int) -> None:
+        if not self.rollback_point_is_marked:
+            raise IndexError(
+                "No rollback point. Call 'mark_rollback_point' before the "
+                "forward calls to be rolled back"
+            )
+        if not (0 <= num <= self._num_since_rollback_point):
+            raise ValueError(
+                f"num = {num}, must be in [0, {self._num_since_rollback_point}] "
+                "(number of tokens inserted since the rollback point)"
+            )
+        if num > 0:
+            self._rollback(num)
+            self._input_pos -= num
+        self.clear_rollback_point()
+
+    def clear_rollback_point(self) -> None:
+        self._num_since_rollback_point = None
+        self._clear_rollback_info()
+
+    def _check_rollback_supported_now(self):
+        """
+        Called in :meth:`mark_rollback_point`. Subclasses can raise an
+        exception if rollback is not possible in the current configuration
+        (for example, if replay logging is switched on).
+
+        """
+        pass
+
+    def _rollback(self, num: int):
+        """
+        Implements :meth:`rollback`. Restores cache content for the `num`
+        most recently inserted tokens. `input_pos` must not be changed here,
+        this is done in :meth:`rollback`. Arguments have been checked.
+
+        Args:
+            num: Number of tokens to remove, `num > 0`
+
+        """
+        raise NotImplementedError()
+
+    def _clear_rollback_info(self):
+        """
+        Frees undo information recorded since the rollback point (if any).
+
+        """
+        pass
 
     @property
     def max_prefill_length(self) -> int:
