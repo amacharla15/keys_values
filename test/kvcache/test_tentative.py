@@ -575,6 +575,10 @@ def test_errors():
     with pytest.raises(IndexError, match="replay logging"):
         updates.start()
     kv_cache.switch_replay_logging(False)
+    kv_cache.set_checkpoint_hook(lambda buffers, chunk_idx: None)
+    with pytest.raises(IndexError, match="checkpoint hook"):
+        updates.start()
+    kv_cache.set_checkpoint_hook(None)
     updates.start()
     assert isinstance(kv_cache.kv_buffers, UndoKVCacheBuffers)
     with pytest.raises(IndexError, match="already been started"):
