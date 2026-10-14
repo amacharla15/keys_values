@@ -19,7 +19,7 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 
-from litgpt.generate.base import sample
+from litgpt.generate.base import multinomial_num_samples_1, sample
 
 from keys_values.constants import DEFAULT_IGNORE_INDEX
 from keys_values.kvcache.factory import deallocate_kv_cache_buffers_of_model
@@ -41,6 +41,32 @@ def batched_sample(
     logits_stack: torch.Tensor,
     kwargs: Union[dict, list[dict]],
 ) -> torch.Tensor:
+    # In batched GRPO rollouts, every row normally uses the same unfiltered
+    # sampling policy. Sample the whole batch at once rather than dispatching
+    # LitGPT's single-row sample() separately for each row.
+    if logits_stack.ndim == 3 and logits_stack.size(0) > 1:
+        if isinstance(kwargs, dict):
+            shared_kwargs = kwargs
+        elif isinstance(kwargs, list) and len(kwargs) == logits_stack.size(0) and all(
+            args == kwargs[0] for args in kwargs
+        ):
+            shared_kwargs = kwargs[0]
+        else:
+            shared_kwargs = None
+
+        if (
+            shared_kwargs is not None
+            and shared_kwargs.keys() <= {"temperature", "top_k", "top_p"}
+            and shared_kwargs.get("top_k") is None
+            and shared_kwargs.get("top_p", 1.0) == 1.0
+            and shared_kwargs.get("temperature", 1.0) > 0.0
+        ):
+            logits = logits_stack[:, -1, :] / shared_kwargs.get("temperature", 1.0)
+            probs = torch.softmax(logits, dim=-1)
+            # Reuse LitGPT's compile/CUDA-graph-aware multinomial helper.
+            return multinomial_num_samples_1(probs).to(dtype=torch.int64)
+
+    # Retain LitGPT's row-by-row path for heterogeneous or filtered sampling.
     # Unbind the logits stack into a list of logits.
     logits = [logits_stack] if logits_stack.ndim == 1 else logits_stack.unbind(0)
     logits = [l.unsqueeze(0) for l in logits]
