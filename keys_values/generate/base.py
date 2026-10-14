@@ -341,7 +341,8 @@ def _batched_generate_impl(
         else:
             logits_stack = gpt_model(tokens)
         tokens = batched_sample(logits_stack, kwargs=sample_args)
-        int_tokens = [token.item() for token in tokens]
+        # Token IDs are only needed on the CPU to check stop sequences.
+        int_tokens = [token.item() for token in tokens] if stop_tokens else []
 
         if return_logprobs:
             # RL-specific log-prob capture lives with the rollout code; import

@@ -149,3 +149,103 @@ def test_generate_different_results_with_different_top_p():
     )
 
     assert not torch.equal(output1, output2)
+
+
+class _FixedLogitsGenerationModel:
+    """Small stand-in for checking generation-loop control flow on CPU."""
+
+    def __init__(self):
+        self.gpt_model = self
+        self.max_seq_length = None
+
+    def __call__(self, tokens, targets=None):
+        return torch.zeros(tokens.shape[0], 1, 64, device=tokens.device)
+
+
+@pytest.mark.parametrize("batch_size", (1, 2, 16))
+@pytest.mark.parametrize("return_logprobs", (False, True))
+def test_batched_generation_without_stops_does_not_read_tokens(
+    batch_size, return_logprobs
+):
+    prompts = torch.arange(batch_size * 2).view(batch_size, 2)
+    sampled_steps = [
+        torch.arange(batch_size).view(-1, 1),
+        torch.arange(batch_size, 2 * batch_size).view(-1, 1),
+    ]
+    with mock.patch.object(generate, "batched_sample", side_effect=sampled_steps):
+        with mock.patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("No stop tokens: .item() is unnecessary"),
+        ):
+            steps = list(
+                generate.batched_generate_fn(
+                    model=_FixedLogitsGenerationModel(),
+                    prompts=prompts,
+                    max_returned_tokens=2,
+                    sample_args={},
+                    stop_tokens=(),
+                    deallocate_cache_buffers=False,
+                    return_logprobs=return_logprobs,
+                    no_inference_mode=True,
+                )
+            )
+
+    token_steps = [step[0] if return_logprobs else step for step in steps]
+    torch.testing.assert_close(torch.cat(token_steps, dim=1), torch.cat(sampled_steps, dim=1))
+    if return_logprobs:
+        logps = torch.cat([step[1] for step in steps], dim=1)
+        active = torch.cat([step[2] for step in steps], dim=1)
+        assert active.all()
+        expected_logps = -torch.log(torch.tensor(64.0)).expand_as(logps)
+        torch.testing.assert_close(logps, expected_logps)
+
+
+@pytest.mark.parametrize(
+    "stop_tokens, sampled_steps, expected_tokens, expected_active",
+    [
+        (
+            ([9],),
+            [[[9], [1]], [[7], [9]]],
+            [[9, -100], [1, 9]],
+            [[True, False], [True, True]],
+        ),
+        (
+            ([9, 10],),
+            [[[9], [1]], [[10], [9]], [[7], [10]]],
+            [[9, 10, -100], [1, 9, 10]],
+            [[True, True, False], [True, True, True]],
+        ),
+    ],
+)
+@pytest.mark.parametrize("return_logprobs", (False, True))
+def test_batched_generation_stopping_and_logprobs_unchanged(
+    stop_tokens, sampled_steps, expected_tokens, expected_active, return_logprobs
+):
+    with mock.patch.object(
+        generate,
+        "batched_sample",
+        side_effect=[torch.tensor(step) for step in sampled_steps],
+    ):
+        steps = list(
+            generate.batched_generate_fn(
+                model=_FixedLogitsGenerationModel(),
+                prompts=torch.tensor([[1, 2], [3, 4]]),
+                max_returned_tokens=5,
+                sample_args={},
+                stop_tokens=stop_tokens,
+                deallocate_cache_buffers=False,
+                return_logprobs=return_logprobs,
+                no_inference_mode=True,
+            )
+        )
+
+    token_steps = [step[0] if return_logprobs else step for step in steps]
+    tokens = torch.cat(token_steps, dim=1)
+    torch.testing.assert_close(tokens, torch.tensor(expected_tokens))
+    if return_logprobs:
+        logps = torch.cat([step[1] for step in steps], dim=1)
+        active = torch.cat([step[2] for step in steps], dim=1)
+        torch.testing.assert_close(active, torch.tensor(expected_active))
+        assert (logps[~active] == 0).all()
+        assert torch.isfinite(logps[active]).all()
